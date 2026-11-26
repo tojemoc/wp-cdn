@@ -59,4 +59,8 @@ ALLOWED_ORIGINS = example.com,www.example.com
 ```
 
 `*.example.com` does **not** match the bare `example.com`; list both.
-The Worker ignores query strings, so replacing an image *at the same path* keeps serving the old R2 copy — and browsers hold it immutably for a year. To refresh: fetch the image once through a URL it has never served, e.g. `photo.jpg?v=2&force=1`. `force` makes the Worker refetch the origin and replace the R2 object; the URL must be fresh because the `force` response is itself cached immutably (reusing `?force=1` alone may hit a stale browser or edge cache). Verify the response shows the new image, then switch your markup to the versioned URL (`photo.jpg?v=2`).
+The Worker ignores query strings, so replacing an image *at the same path* keeps serving the old R2 copy — and browsers hold it immutably for a year. To refresh:
+
+1. Fetch the image once through a URL it has never served, e.g. `photo.jpg?v=2&force=1`. `force` makes the Worker refetch the origin and replace the R2 object; the URL must be fresh because the `force` response is itself cached immutably (reusing `?force=1` alone may hit a stale browser or edge cache).
+2. Verify the new copy actually landed — the R2 write finishes in the background, so fetch the URL again or check the bucket before switching. Some origin responses are never stored at all (`Cache-Control: no-store`, `private`, or `no-cache`; a `Vary` on anything but `Accept-Encoding`; or an encoded body) — for those the Worker always streams from the origin and this procedure does nothing.
+3. Switch your markup to a *new* versioned URL — `photo.jpg?v=2`, then `v=3` on the next refresh. Never reuse a versioned URL a browser may already hold; it stays frozen for a year.

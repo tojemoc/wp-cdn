@@ -288,7 +288,11 @@ export default {
 					// range — an If-Range mismatch (rangeInfo null) must refetch the body.
 					fullObject = rangeData;
 				} else if (rangeHeader) {
-					fullObject = await getFromCache(env, parsed.cacheKey);
+					// Conditional read: the object may have been replaced since the head
+					// we based rangeInfo and the response headers on. A failed
+					// precondition comes back bodyless -> take the redirect path.
+					const result = await env.R2.get(parsed.cacheKey, { onlyIf: { etagMatches: cacheResult.etag } });
+					fullObject = result && "body" in result ? result as R2ObjectBody : null;
 				}
 				if (!fullObject) {
 					return new Response(null, {
@@ -445,7 +449,6 @@ export default {
 				&& !encoded;
 
 			const { stream: limitedStream, byteCount } = createSizeLimitedStream(response.body, maxSize);
-			let responseStream: ReadableStream = limitedStream;
 
 			ctx.waitUntil(
 				byteCount.then((bytes) => {
@@ -454,56 +457,67 @@ export default {
 				})
 			);
 
-			if (canStore) {
+			let responseStream: ReadableStream;
+			{
 				// Bounded fan-out: each chunk goes to both branches in lockstep, so
 				// buffering never grows past the slower consumer (tee() buffers
 				// unboundedly). A dead cache branch is dropped, never the client's.
+				// The fetch timeout is an inactivity limit: it runs only while we wait
+				// on an upstream read and pauses while we wait on a stalled client —
+				// a paused <video> must not abort a healthy origin stream.
+				const fetchTimeout = parseInt(env.FETCH_TIMEOUT || "30000", 10);
 				const clientTee = new TransformStream<Uint8Array, Uint8Array>();
-				const cacheTee = new TransformStream<Uint8Array, Uint8Array>();
+				const cacheTee = canStore ? new TransformStream<Uint8Array, Uint8Array>() : null;
 				const clientWriter = clientTee.writable.getWriter();
-				const cacheWriter = cacheTee.writable.getWriter();
+				const cacheWriter = cacheTee?.writable.getWriter() ?? null;
+				responseStream = clientTee.readable;
 				ctx.waitUntil((async () => {
 					const reader = limitedStream.getReader();
-					let cacheAlive = true;
+					let cacheAlive = cacheWriter !== null;
+					let timer: ReturnType<typeof setTimeout> | undefined;
 					try {
 						for (;;) {
+							timer = setTimeout(() => void reader.cancel(new Error(`Origin stalled for ${fetchTimeout}ms`)), fetchTimeout);
 							const { done, value } = await reader.read();
+							clearTimeout(timer);
 							if (done) break;
 							await clientWriter.write(value);
 							if (cacheAlive) {
 								try {
-									await cacheWriter.write(value);
+									await cacheWriter!.write(value);
 								} catch {
 									cacheAlive = false;
 								}
 							}
 						}
 						await clientWriter.close();
-						if (cacheAlive) await cacheWriter.close();
+						if (cacheAlive) await cacheWriter!.close();
 					} catch (e) {
-						await Promise.allSettled([clientWriter.abort(e), cacheAlive ? cacheWriter.abort(e) : Promise.resolve()]);
+						if (timer) clearTimeout(timer);
+						await Promise.allSettled([clientWriter.abort(e), cacheAlive ? cacheWriter!.abort(e) : Promise.resolve()]);
 					}
 				})());
-				responseStream = clientTee.readable;
 
-				ctx.waitUntil(
-					storeInCacheStream(
-						env,
-						parsed.cacheKey,
-						cacheTee.readable,
-						contentType,
-						contentLength,
-						parsed.sourceUrl,
-						parsed.domain
-					).catch((e) => {
-						console.error("Failed to store in cache:", e);
-					})
-				);
-				addLog("Storing in R2", "streaming (background)");
-			} else {
-				addLog("Skipping R2 store", "origin cache policy, Vary, or content-encoding");
+				if (canStore && cacheTee) {
+					ctx.waitUntil(
+						storeInCacheStream(
+							env,
+							parsed.cacheKey,
+							cacheTee.readable,
+							contentType,
+							contentLength,
+							parsed.sourceUrl,
+							parsed.domain
+						).catch((e) => {
+							console.error("Failed to store in cache:", e);
+						})
+					);
+					addLog("Storing in R2", "streaming (background)");
+				} else {
+					addLog("Skipping R2 store", "origin cache policy, Vary, or content-encoding");
+				}
+				addLog("Serving media", `streaming, ${contentType}`);
 			}
-			addLog("Serving media", `streaming, ${contentType}`);
 
 			const shouldReturn206 = rangeHeader && contentLength !== null && contentLength > 0;
 			const status = shouldReturn206 ? 206 : 200;
