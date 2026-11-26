@@ -6,10 +6,15 @@ export interface RangeInfo {
 }
 
 export function parseRangeHeader(rangeHeader: string | null, totalSize: number): RangeInfo | null {
-	if (!rangeHeader || !rangeHeader.startsWith("bytes=")) {
+	if (!rangeHeader) {
 		return null;
 	}
-	const rangeSpec = rangeHeader.substring(6).trim();
+	const header = rangeHeader.trim();
+	// The range unit is case-insensitive per RFC 9110.
+	if (!header.toLowerCase().startsWith("bytes=")) {
+		return null;
+	}
+	const rangeSpec = header.substring(6).trim();
 	if (rangeSpec.includes(",")) {
 		return null;
 	}
@@ -19,6 +24,10 @@ export function parseRangeHeader(rangeHeader: string | null, totalSize: number):
 	}
 	const startStr = rangeSpec.substring(0, dashIndex);
 	const endStr = rangeSpec.substring(dashIndex + 1);
+	// Reject malformed numbers like "10x" instead of accepting a numeric prefix.
+	if ((startStr !== "" && !/^\d+$/.test(startStr)) || (endStr !== "" && !/^\d+$/.test(endStr))) {
+		return null;
+	}
 	let start: number;
 	let end: number;
 	if (startStr === "") {

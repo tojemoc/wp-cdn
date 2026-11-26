@@ -30,14 +30,14 @@ If both claim an extension, CDN 1 wins and the settings page tells you.
 ## Install / migrate
 
 1. Upload and activate **Simple CDN**. If Bandwidth Saver (self-hosted mode) or CDN Enabler had a hostname saved, it is imported automatically.
-2. Open **Settings → Simple CDN** and check the *Preview* line at the bottom.
+2. Open **Settings → Simple CDN**, enter a CDN hostname, pick a URL style, tick *Rewrite URLs on the front end* and **Save**. Then check the *Preview* line at the bottom.
 3. Deactivate the old plugin(s). Their settings stay in the database; delete the plugins whenever you're happy.
 4. View source on a page and confirm image URLs point at your CDN hostname.
 
 ## What was intentionally dropped from Bandwidth Saver
 
 * Everything that talks to `billing.bandwidth-saver.com`: accounts, Stripe checkout, plan selector, usage charts, API-key encryption, onboarding (~90% of the plugin's code).
-* The per-image `onerror` fallback, its 14 KB JS file and CSS. The Worker already answers with a 302 to your origin whenever it can't serve a file itself, so the fallback only matters in a full Cloudflare outage. It's easy to add back if you want it.
+* The per-image `onerror` fallback, its 14 KB JS file and CSS. The Worker answers with a 302 to your origin whenever it knows upfront that it can't serve a file. One case slips through: when the origin omits `Content-Length` (chunked responses) and the body exceeds `MAX_FILE_SIZE`, the Worker only finds out mid-stream and cannot redirect — the image just breaks. It's easy to add the fallback back if you want it.
 * Rewriting every image host. Only *your* site's hostnames are rewritten (add more with the `simple_cdn_site_hostnames` filter).
 
 ## Filters
@@ -59,4 +59,4 @@ ALLOWED_ORIGINS = example.com,www.example.com
 ```
 
 `*.example.com` does **not** match the bare `example.com`; list both.
-The Worker ignores query strings, so replacing an image *at the same path* keeps serving the old R2 copy. Delete the object in R2, or request it once with `?force=1`.
+The Worker ignores query strings, so replacing an image *at the same path* keeps serving the old R2 copy. Deleting the object in R2 (or fetching once with `?force=1`) is not enough on its own: the Worker also tells browsers to cache the file immutably for a year, so visitors keep their copy. To actually refresh an image, give it a new URL — for example a versioned query string like `photo.jpg?v=2` — after updating R2.

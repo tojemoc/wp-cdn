@@ -1,11 +1,11 @@
 import type { Env, LogEntry } from "./env";
 import { VERSION, getCORSHeaders } from "./utils";
 
-export function createStatsResponse(_env: Env): Response {
+export function createStatsResponse(env: Env): Response {
 	const stats = {
 		status: "healthy",
 		version: VERSION,
-		mode: "single-domain",
+		mode: env.ORIGIN_MODE || "open",
 		features: {
 			caching: "R2 CDN caching enabled",
 			streaming: "Large file streaming support",

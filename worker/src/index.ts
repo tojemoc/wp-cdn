@@ -1,8 +1,8 @@
 import type { Env, LogEntry } from "./env";
 import { parseUrl, validateOrigin, validateUrlForFetch, isMediaContentType, isImageContentType } from "./validation";
 import { fetchMediaFromOrigin, validateResponseSize, createSizeLimitedStream } from "./origin";
-import { VERSION, getCORSHeaders, errorResponse, formatBytes, parseFileSize } from "./utils";
-import { getFromCache, getCacheHead, handleConditionalRequest, getFromCacheWithRange, storeInCacheStream } from "./cache";
+import { VERSION, getCORSHeaders, errorResponse, formatBytes, parseFileSize, mediaSafetyHeaders } from "./utils";
+import { getFromCache, getCacheHead, handleConditionalRequest, etagMatches, getFromCacheWithRange, storeInCacheStream, deleteIfUnchanged } from "./cache";
 import { parseRangeHeader, buildContentRangeHeader } from "./range";
 import { createHtmlViewer } from "./viewer";
 import { createStatsResponse, createLogger } from "./analytics";
@@ -56,7 +56,8 @@ export default {
 			}
 
 			const isHeadRequest = request.method === "HEAD";
-			const rangeHeader = request.headers.get("Range");
+			// Normalized once: range units and syntax are case-insensitive.
+			const rangeHeader = request.headers.get("Range")?.trim().toLowerCase() ?? null;
 
 			let standardRangeStart: number | null = null;
 			let standardRangeEnd: number | null = null;
@@ -67,7 +68,9 @@ export default {
 					standardRangeEnd = parseInt(match[2], 10);
 				}
 			}
-			const isStandardRange = standardRangeStart !== null && standardRangeEnd !== null && standardRangeStart <= standardRangeEnd;
+			const isStandardRange = standardRangeStart !== null && standardRangeEnd !== null
+				&& Number.isSafeInteger(standardRangeStart) && Number.isSafeInteger(standardRangeEnd)
+				&& standardRangeStart <= standardRangeEnd;
 			const isFullFileRange = rangeHeader === "bytes=0-";
 
 			const [validation, cacheResult, rangeData] = await Promise.all([
@@ -118,7 +121,7 @@ export default {
 				if (headResult) {
 					const cachedContentType = (headResult.httpMetadata?.contentType || "").toLowerCase();
 					if (!isMediaContentType(cachedContentType)) {
-						ctx.waitUntil(env.R2.delete(parsed.cacheKey).catch(() => {
+						ctx.waitUntil(deleteIfUnchanged(env, parsed.cacheKey, headResult.etag).catch(() => {
 						}));
 						return new Response(null, {
 							status: 302,
@@ -130,6 +133,12 @@ export default {
 							}
 						});
 					}
+					const conditionalResponse = handleConditionalRequest(request, headResult.httpEtag);
+					if (conditionalResponse) {
+						addLog("Conditional request", "304 Not Modified");
+						trackUsage(env, ctx, parsed.domain, 0, true, validation.domain_records);
+						return conditionalResponse;
+					}
 					addLog("HEAD cache hit", `${headResult.size} bytes`);
 					return new Response(null, {
 						status: 200,
@@ -137,7 +146,8 @@ export default {
 							"Content-Type": headResult.httpMetadata?.contentType || "application/octet-stream",
 							"Content-Length": headResult.size.toString(),
 							"Accept-Ranges": "bytes",
-							"ETag": headResult.etag,
+							"ETag": headResult.httpEtag,
+							...mediaSafetyHeaders(headResult.httpMetadata?.contentType || ""),
 							"Last-Modified": headResult.uploaded.toUTCString(),
 							"Cache-Control": "public, max-age=31536000, immutable",
 							"X-ImgPro-Status": "hit",
@@ -163,7 +173,7 @@ export default {
 				const cachedContentType = (cacheResult.httpMetadata?.contentType || "").toLowerCase();
 				if (!isMediaContentType(cachedContentType)) {
 					addLog("Invalid cached content", `${cachedContentType} - deleting and redirecting`);
-					ctx.waitUntil(env.R2.delete(parsed.cacheKey).catch((e) => {
+					ctx.waitUntil(deleteIfUnchanged(env, parsed.cacheKey, cacheResult.etag).catch((e) => {
 						console.error("Failed to delete invalid cache entry:", e);
 					}));
 					return new Response(null, {
@@ -178,7 +188,7 @@ export default {
 					});
 				}
 
-				const conditionalResponse = handleConditionalRequest(request, cacheResult.etag);
+				const conditionalResponse = handleConditionalRequest(request, cacheResult.httpEtag);
 				if (conditionalResponse) {
 					addLog("Conditional request", "304 Not Modified");
 					trackUsage(env, ctx, parsed.domain, 0, true, validation.domain_records);
@@ -188,9 +198,14 @@ export default {
 				const contentType = cacheResult.httpMetadata?.contentType || "application/octet-stream";
 				const metadata = cacheResult.customMetadata || {};
 				const totalSize = cacheResult.size;
-				const rangeInfo = rangeHeader ? parseRangeHeader(rangeHeader, totalSize) : null;
+				// If-Range: a mismatched validator means the client holds a different
+				// representation — ignore Range and send the full 200 response.
+				// shortcut: a date-form If-Range never matches, so we resend the body.
+				const ifRange = request.headers.get("If-Range");
+				const rangeAllowed = !ifRange || etagMatches(ifRange.trim(), cacheResult.httpEtag);
+				const rangeInfo = rangeHeader && rangeAllowed ? parseRangeHeader(rangeHeader, totalSize) : null;
 
-				if (rangeHeader && !rangeInfo) {
+				if (rangeHeader && rangeAllowed && !rangeInfo) {
 					addLog("Invalid range", `${rangeHeader} for size ${totalSize}`);
 					return new Response("Range Not Satisfiable", {
 						status: 416,
@@ -202,9 +217,12 @@ export default {
 					});
 				}
 
+				// The viewer buffers the image plus a base64 copy; cap it so a large
+				// file can't blow the 128MB memory limit. Bigger files just stream.
+				const VIEWER_MAX_BYTES = 10 * 1024 * 1024;
 				if (parsed.viewImage && env.DEBUG === "true" && isImageContentType(contentType)) {
 					const fullObjectForView = rangeHeader ? await getFromCache(env, parsed.cacheKey) : cacheResult;
-					if (fullObjectForView && "body" in fullObjectForView) {
+					if (fullObjectForView && "body" in fullObjectForView && fullObjectForView.size <= VIEWER_MAX_BYTES) {
 						const imageData = await (fullObjectForView as R2ObjectBody).arrayBuffer();
 						const totalTime = Date.now() - startTime;
 						addLog("Generating HTML viewer", `${imageData.byteLength} bytes in ${totalTime}ms`);
@@ -226,7 +244,11 @@ export default {
 
 				if (rangeInfo?.isPartial) {
 					addLog("Range request", `bytes ${rangeInfo.start}-${rangeInfo.end}/${totalSize}`);
-					const partialObject = isStandardRange && rangeData ? rangeData : await getFromCacheWithRange(env, parsed.cacheKey, rangeInfo);
+					// The range body must belong to the same object version as the head
+					// we based rangeInfo on — an etag mismatch falls back to redirect.
+					const partialObject = isStandardRange && rangeData && rangeData.etag === cacheResult.etag
+						? rangeData
+						: await getFromCacheWithRange(env, parsed.cacheKey, rangeInfo, cacheResult.etag);
 					if (!partialObject) {
 						return new Response(null, {
 							status: 302,
@@ -247,7 +269,8 @@ export default {
 							"Content-Range": buildContentRangeHeader(rangeInfo.start, rangeInfo.end, totalSize),
 							"Accept-Ranges": "bytes",
 							"Cache-Control": "public, max-age=31536000, immutable",
-							"ETag": cacheResult.etag,
+							"ETag": cacheResult.httpEtag,
+							...mediaSafetyHeaders(contentType),
 							"Last-Modified": cacheResult.uploaded.toUTCString(),
 							"X-ImgPro-Status": "hit",
 							"X-ImgPro-Cached-At": metadata.cachedAt || "",
@@ -283,7 +306,8 @@ export default {
 					"Content-Length": fullObject.size.toString(),
 					"Accept-Ranges": "bytes",
 					"Cache-Control": "public, max-age=31536000, immutable",
-					"ETag": cacheResult.etag,
+					"ETag": cacheResult.httpEtag,
+					...mediaSafetyHeaders(contentType),
 					"Last-Modified": cacheResult.uploaded.toUTCString(),
 					"X-ImgPro-Status": "hit",
 					"X-ImgPro-Cached-At": metadata.cachedAt || "",
@@ -343,7 +367,9 @@ export default {
 				});
 			}
 
-			if (!response.ok) {
+			// Only a complete 200 body may be cached — a 206 or any other status
+			// would poison the bucket with partial or unexpected content.
+			if (response.status !== 200) {
 				addLog("Origin fetch failed", `HTTP ${response.status} - redirecting to origin`);
 				return new Response(null, {
 					status: 302,
@@ -401,8 +427,22 @@ export default {
 				});
 			}
 
+			// Honor the origin's cache policy: private/no-store/no-cache bodies, and
+			// responses that Vary on anything but Accept-Encoding (the runtime manages
+			// encodings), are streamed to the client but never written to R2 or marked
+			// publicly immutable. An encoded body (we asked for identity) is also
+			// passed through uncached.
+			const originCc = response.headers.get("cache-control") || "";
+			const varyFields = (response.headers.get("vary") || "")
+				.toLowerCase().split(",").map((f) => f.trim()).filter((f) => f !== "");
+			const contentEncoding = response.headers.get("content-encoding");
+			const encoded = !!contentEncoding && contentEncoding.toLowerCase() !== "identity";
+			const canStore = !/\b(no-store|private|no-cache)\b/.test(originCc.toLowerCase())
+				&& varyFields.every((f) => f === "accept-encoding")
+				&& !encoded;
+
 			const { stream: limitedStream, byteCount } = createSizeLimitedStream(response.body, maxSize);
-			const [cacheStream, responseStream] = limitedStream.tee();
+			let responseStream: ReadableStream = limitedStream;
 
 			ctx.waitUntil(
 				byteCount.then((bytes) => {
@@ -411,20 +451,55 @@ export default {
 				})
 			);
 
-			ctx.waitUntil(
-				storeInCacheStream(
-					env,
-					parsed.cacheKey,
-					cacheStream,
-					contentType,
-					contentLength,
-					parsed.sourceUrl,
-					parsed.domain
-				).catch((e) => {
-					console.error("Failed to store in cache:", e);
-				})
-			);
-			addLog("Storing in R2", "streaming (background)");
+			if (canStore) {
+				// Bounded fan-out: each chunk goes to both branches in lockstep, so
+				// buffering never grows past the slower consumer (tee() buffers
+				// unboundedly). A dead cache branch is dropped, never the client's.
+				const clientTee = new TransformStream<Uint8Array, Uint8Array>();
+				const cacheTee = new TransformStream<Uint8Array, Uint8Array>();
+				const clientWriter = clientTee.writable.getWriter();
+				const cacheWriter = cacheTee.writable.getWriter();
+				ctx.waitUntil((async () => {
+					const reader = limitedStream.getReader();
+					let cacheAlive = true;
+					try {
+						for (;;) {
+							const { done, value } = await reader.read();
+							if (done) break;
+							await clientWriter.write(value);
+							if (cacheAlive) {
+								try {
+									await cacheWriter.write(value);
+								} catch {
+									cacheAlive = false;
+								}
+							}
+						}
+						await clientWriter.close();
+						if (cacheAlive) await cacheWriter.close();
+					} catch (e) {
+						await Promise.allSettled([clientWriter.abort(e), cacheAlive ? cacheWriter.abort(e) : Promise.resolve()]);
+					}
+				})());
+				responseStream = clientTee.readable;
+
+				ctx.waitUntil(
+					storeInCacheStream(
+						env,
+						parsed.cacheKey,
+						cacheTee.readable,
+						contentType,
+						contentLength,
+						parsed.sourceUrl,
+						parsed.domain
+					).catch((e) => {
+						console.error("Failed to store in cache:", e);
+					})
+				);
+				addLog("Storing in R2", "streaming (background)");
+			} else {
+				addLog("Skipping R2 store", "origin cache policy, Vary, or content-encoding");
+			}
 			addLog("Serving media", `streaming, ${contentType}`);
 
 			const shouldReturn206 = rangeHeader && contentLength !== null && contentLength > 0;
@@ -432,10 +507,14 @@ export default {
 			const responseHeaders: Record<string, string> = {
 				"Content-Type": contentType,
 				"Accept-Ranges": "bytes",
-				"Cache-Control": "public, max-age=31536000, immutable",
+				"Cache-Control": canStore ? "public, max-age=31536000, immutable" : originCc || "private, no-store",
 				"X-ImgPro-Status": "miss",
+				...mediaSafetyHeaders(contentType),
 				...getCORSHeaders()
 			};
+			if (encoded && contentEncoding) {
+				responseHeaders["Content-Encoding"] = contentEncoding;
+			}
 			if (contentLength !== null) {
 				responseHeaders["Content-Length"] = contentLength.toString();
 			}

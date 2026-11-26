@@ -36,22 +36,31 @@ export function normalizePath(path: string): string {
 }
 
 export function parseUrl(url: URL): ParsedUrl {
-	const decodedPathname = decodeURIComponent(url.pathname);
-	const pathParts = decodedPathname.replace(/^\/+/, "").split("/");
-	if (pathParts.length < 2) {
+	// Split on literal "/" before decoding so an encoded slash (%2F) stays inside
+	// its segment instead of becoming a route separator. The canonical path keeps
+	// it distinct: "a%2Fb" is not the same asset as "a/b".
+	const rawSegments = url.pathname.replace(/^\/+/, "").split("/");
+	if (rawSegments.length < 2) {
 		throw new Error("Invalid URL format: /domain.com/path/to/image.jpg");
 	}
-	const domain = pathParts[0].toLowerCase();
-	const rawPath = "/" + pathParts.slice(1).join("/");
-	const path = normalizePath(rawPath);
+	const domain = decodeURIComponent(rawSegments[0]).toLowerCase();
+	const segments: string[] = [];
+	for (const raw of rawSegments.slice(1)) {
+		const segment = decodeURIComponent(raw);
+		if (segment === "..") {
+			segments.pop();
+		} else if (segment !== "." && segment !== "") {
+			segments.push(segment);
+		}
+	}
+	const path = "/" + segments.map(encodeURIComponent).join("/");
 	if (path === "/" || path === "") {
 		throw new Error("Invalid path: path traversal detected");
 	}
 	if (!isValidDomain(domain)) {
 		throw new Error(`Invalid domain: ${domain}`);
 	}
-	const encodedPath = path.split("/").map((segment) => encodeURIComponent(segment)).join("/");
-	const sourceUrl = `https://${domain}${encodedPath}`;
+	const sourceUrl = `https://${domain}${path}`;
 	const cacheKey = `${domain}${path}`;
 	const forceReprocess = url.searchParams.get("force") === "true" || url.searchParams.get("force") === "1";
 	const viewImage = url.searchParams.get("view") === "true" || url.searchParams.get("view") === "1";
@@ -138,7 +147,7 @@ async function getDomainRecords(domain: string, kv: KVNamespace): Promise<Domain
 
 export async function validateOrigin(domain: string, env: Env): Promise<OriginValidation> {
 	const mode = env.ORIGIN_MODE || "open";
-	const configBlocked = env.BLOCKED_ORIGINS || "";
+	const configBlocked = (env.BLOCKED_ORIGINS || "").trim();
 	if (configBlocked === "*") {
 		return { allowed: false, reason: "blocked", source: "config" };
 	}

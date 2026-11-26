@@ -7,10 +7,25 @@ const STORAGE_KEYS = {
 	REQUESTS: "requests",
 	CACHE_HITS: "cacheHits",
 	CACHE_MISSES: "cacheMisses",
-	D1_FAILURES: "d1Failures"
+	D1_FAILURES: "d1Failures",
+	PENDING_FLUSH: "pendingFlush"
 };
 
 const D1_FAILURE_ALERT_THRESHOLD = 5;
+
+// What one flush wrote to D1. Stored before the write so a crash mid-flush can
+// be settled without double-counting: the flush_id row is written inside the
+// same D1 transaction as the counters, so it exists iff the whole batch applied.
+interface PendingFlush {
+	id: string;
+	siteId: number;
+	domain: string;
+	hourStart: number;
+	bandwidth: number;
+	requests: number;
+	cacheHits: number;
+	cacheMisses: number;
+}
 
 interface UsageMetrics {
 	siteId: number;
@@ -40,7 +55,8 @@ export class SiteUsageTracker {
 		this.state.blockConcurrencyWhile(async () => {
 			await this.loadFromStorage();
 			const existingAlarm = await this.state.storage.getAlarm();
-			if (!existingAlarm && this.env.BILLING_DB) {
+			// Arm only when there is (or might be) usage waiting to flush.
+			if (!existingAlarm && this.env.BILLING_DB && this.requests > 0) {
 				await this.state.storage.setAlarm(Date.now() + 60000);
 			}
 		});
@@ -97,6 +113,9 @@ export class SiteUsageTracker {
 			updates.set(STORAGE_KEYS.CACHE_HITS, this.cacheHits);
 			updates.set(STORAGE_KEYS.CACHE_MISSES, this.cacheMisses);
 			await this.state.storage.put(Object.fromEntries(updates));
+			if (this.env.BILLING_DB && !(await this.state.storage.getAlarm())) {
+				await this.state.storage.setAlarm(Date.now() + 60000);
+			}
 			return new Response("OK", { status: 200 });
 		} catch (err) {
 			console.error("Usage tracker fetch error:", err);
@@ -124,55 +143,77 @@ export class SiteUsageTracker {
 			await this.state.storage.deleteAlarm();
 			return;
 		}
-		const now = Math.floor(Date.now() / 1000);
-		if (this.requests === 0) {
-			try {
-				await this.state.storage.setAlarm(Date.now() + 60000);
-			} catch (alarmErr) {
-				console.error("[UsageTracker] Failed to reschedule idle alarm:", alarmErr);
+		const db = this.env.BILLING_DB;
+
+		// Replay a stored flush instead of recomputing from counters: if the last
+		// attempt died after the D1 write but before the checkpoint, recomputing
+		// would double-count. The flush_id row lives in the same transaction as
+		// the deltas, so it exists iff the batch applied.
+		let pending = (await this.state.storage.get(STORAGE_KEYS.PENDING_FLUSH)) as PendingFlush | undefined;
+		if (!pending) {
+			if (this.requests === 0) {
+				return; // nothing pending, no alarm needed
 			}
-			return;
+			pending = {
+				id: crypto.randomUUID(),
+				siteId: this.siteId,
+				domain: this.domain,
+				hourStart: Math.floor(Date.now() / 3600000) * 3600,
+				bandwidth: this.bandwidth,
+				requests: this.requests,
+				cacheHits: this.cacheHits,
+				cacheMisses: this.cacheMisses
+			};
+			await this.state.storage.put(STORAGE_KEYS.PENDING_FLUSH, pending);
 		}
-		const hourStart = Math.floor(Date.now() / 3600000) * 3600;
-		const flushBandwidth = this.bandwidth;
-		const flushRequests = this.requests;
-		const flushCacheHits = this.cacheHits;
-		const flushCacheMisses = this.cacheMisses;
-		const flushSiteId = this.siteId;
-		const flushDomain = this.domain;
-		let d1Succeeded = false;
+		const now = Math.floor(Date.now() / 1000);
 		try {
-			const batch = [
-				// Update current period totals in sites table
-				this.env.BILLING_DB.prepare(
-					`UPDATE sites SET
-						bandwidth_used_bytes = bandwidth_used_bytes + ?,
-						cache_hits = cache_hits + ?,
-						cache_misses = cache_misses + ?,
-						updated_at = ?
-					WHERE id = ?`
-				).bind(flushBandwidth, flushCacheHits, flushCacheMisses, now, flushSiteId),
-				// Insert/update hourly rollup
-				this.env.BILLING_DB.prepare(
-					`INSERT INTO usage_hourly (site_id, hour_start, bandwidth_bytes, requests, cache_hits, cache_misses, created_at, updated_at)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-					ON CONFLICT (site_id, hour_start) DO UPDATE SET
-						bandwidth_bytes = bandwidth_bytes + excluded.bandwidth_bytes,
-						requests = requests + excluded.requests,
-						cache_hits = cache_hits + excluded.cache_hits,
-						cache_misses = cache_misses + excluded.cache_misses,
-						updated_at = excluded.updated_at`
-				).bind(flushSiteId, hourStart, flushBandwidth, flushRequests, flushCacheHits, flushCacheMisses, now, now)
-			];
-			await this.env.BILLING_DB.batch(batch);
-			d1Succeeded = true;
-			console.log(
-				`[UsageTracker] Flushed ${flushDomain}: ${flushRequests} req, ${flushBandwidth} bytes, ${flushCacheHits} hits, ${flushCacheMisses} misses`
-			);
-			this.bandwidth -= flushBandwidth;
-			this.requests -= flushRequests;
-			this.cacheHits -= flushCacheHits;
-			this.cacheMisses -= flushCacheMisses;
+			await db.prepare(
+				"CREATE TABLE IF NOT EXISTS usage_flushes (flush_id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)"
+			).run();
+			try {
+				await db.batch([
+					// Claim the flush id; a conflict aborts the whole batch.
+					db.prepare(
+						"INSERT INTO usage_flushes (flush_id, applied_at) VALUES (?, ?)"
+					).bind(pending.id, now),
+					// Update current period totals in sites table
+					db.prepare(
+						`UPDATE sites SET
+							bandwidth_used_bytes = bandwidth_used_bytes + ?,
+							cache_hits = cache_hits + ?,
+							cache_misses = cache_misses + ?,
+							updated_at = ?
+						WHERE id = ?`
+					).bind(pending.bandwidth, pending.cacheHits, pending.cacheMisses, now, pending.siteId),
+					// Insert/update hourly rollup
+					db.prepare(
+						`INSERT INTO usage_hourly (site_id, hour_start, bandwidth_bytes, requests, cache_hits, cache_misses, created_at, updated_at)
+						VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+						ON CONFLICT (site_id, hour_start) DO UPDATE SET
+							bandwidth_bytes = bandwidth_bytes + excluded.bandwidth_bytes,
+							requests = requests + excluded.requests,
+							cache_hits = cache_hits + excluded.cache_hits,
+							cache_misses = cache_misses + excluded.cache_misses,
+							updated_at = excluded.updated_at`
+					).bind(pending.siteId, pending.hourStart, pending.bandwidth, pending.requests, pending.cacheHits, pending.cacheMisses, now, now)
+				]);
+				console.log(
+					`[UsageTracker] Flushed ${pending.domain}: ${pending.requests} req, ${pending.bandwidth} bytes, ${pending.cacheHits} hits, ${pending.cacheMisses} misses`
+				);
+			} catch (batchErr) {
+				// Duplicate flush_id means an earlier attempt committed the batch
+				// but crashed before the checkpoint — settle without reapplying.
+				const seen = await db.prepare(
+					"SELECT flush_id FROM usage_flushes WHERE flush_id = ?"
+				).bind(pending.id).first();
+				if (!seen) throw batchErr;
+				console.log(`[UsageTracker] Flush ${pending.id} already applied; settling checkpoint for ${pending.domain}`);
+			}
+			this.bandwidth -= pending.bandwidth;
+			this.requests -= pending.requests;
+			this.cacheHits -= pending.cacheHits;
+			this.cacheMisses -= pending.cacheMisses;
 			this.d1Failures = 0;
 			await this.state.storage.put({
 				[STORAGE_KEYS.BANDWIDTH]: this.bandwidth,
@@ -181,35 +222,32 @@ export class SiteUsageTracker {
 				[STORAGE_KEYS.CACHE_MISSES]: this.cacheMisses,
 				[STORAGE_KEYS.D1_FAILURES]: 0
 			});
+			await this.state.storage.delete(STORAGE_KEYS.PENDING_FLUSH);
 		} catch (err) {
-			if (d1Succeeded) {
-				console.error(
-					`[UsageTracker] CRITICAL: D1 succeeded but storage failed for ${flushDomain}. If DO evicts before storage recovers, data may be double-counted. Flushed: ${flushBandwidth} bytes, ${flushRequests} requests.`,
-					err
-				);
-			} else {
-				try {
-					this.d1Failures += 1;
-					await this.state.storage.put(STORAGE_KEYS.D1_FAILURES, this.d1Failures);
-					console.error(`[UsageTracker] D1 write failed for ${flushDomain}:`, err, {
-						consecutiveFailures: this.d1Failures,
-						accumulatedBandwidth: this.bandwidth,
-						accumulatedRequests: this.requests
-					});
-					if (this.d1Failures >= D1_FAILURE_ALERT_THRESHOLD) {
-						console.error(
-							`[UsageTracker] ALERT: ${this.d1Failures} consecutive D1 failures for site:${flushSiteId} (${flushDomain}). Accumulated: ${this.bandwidth} bytes, ${this.requests} requests. Data preserved in DO storage, will retry on next alarm.`
-						);
-					}
-				} catch (storageErr) {
-					console.error(`[UsageTracker] Storage error while tracking D1 failure for ${flushDomain}:`, storageErr);
+			try {
+				this.d1Failures += 1;
+				await this.state.storage.put(STORAGE_KEYS.D1_FAILURES, this.d1Failures);
+				console.error(`[UsageTracker] D1 write failed for ${pending.domain}:`, err, {
+					consecutiveFailures: this.d1Failures,
+					accumulatedBandwidth: this.bandwidth,
+					accumulatedRequests: this.requests
+				});
+				if (this.d1Failures >= D1_FAILURE_ALERT_THRESHOLD) {
+					console.error(
+						`[UsageTracker] ALERT: ${this.d1Failures} consecutive D1 failures for site:${pending.siteId} (${pending.domain}). Accumulated: ${this.bandwidth} bytes, ${this.requests} requests. Data preserved in DO storage, will retry on next alarm.`
+					);
 				}
+			} catch (storageErr) {
+				console.error(`[UsageTracker] Storage error while tracking D1 failure for ${pending.domain}:`, storageErr);
 			}
 		} finally {
-			try {
-				await this.state.storage.setAlarm(Date.now() + 60000);
-			} catch (alarmErr) {
-				console.error(`[UsageTracker] CRITICAL: Failed to reschedule alarm for ${flushDomain}:`, alarmErr);
+			// Keep retrying while usage remains; stop scheduling once counters are empty.
+			if (this.requests > 0) {
+				try {
+					await this.state.storage.setAlarm(Date.now() + 60000);
+				} catch (alarmErr) {
+					console.error(`[UsageTracker] CRITICAL: Failed to reschedule alarm for ${pending.domain}:`, alarmErr);
+				}
 			}
 		}
 	}

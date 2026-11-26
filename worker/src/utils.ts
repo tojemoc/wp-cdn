@@ -4,9 +4,20 @@ export function getCORSHeaders(): Record<string, string> {
 	return {
 		"Access-Control-Allow-Origin": "*",
 		"Access-Control-Allow-Methods": "GET, HEAD, DELETE, OPTIONS",
-		"Access-Control-Allow-Headers": "Content-Type",
+		"Access-Control-Allow-Headers": "Content-Type, Range, If-None-Match, If-Range",
 		"Access-Control-Max-Age": "86400"
 	};
+}
+
+// SVG can carry scripts; sandboxed headers keep a hijacked SVG from running
+// them when someone opens the CDN URL directly.
+export function mediaSafetyHeaders(contentType: string): Record<string, string> {
+	return contentType.toLowerCase().split(";")[0].trim() === "image/svg+xml"
+		? {
+			"Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
+			"X-Content-Type-Options": "nosniff"
+		}
+		: {};
 }
 
 export function errorResponse(message: string, status: number): Response {

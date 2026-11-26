@@ -25,6 +25,10 @@ jobs:
         working-directory: worker
         run: npm ci && npm run typecheck
 
+      - name: Worker self-check
+        working-directory: worker
+        run: npm test
+
       - name: Build worker bundle
         working-directory: worker
         run: npm run build

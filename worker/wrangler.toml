@@ -37,7 +37,7 @@ DEBUG = "false"
 #
 # [[migrations]]
 # tag = "v1"
-# new_classes = ["SiteUsageTracker"]
+# new_sqlite_classes = ["SiteUsageTracker"]
 #
 # [[d1_databases]]
 # binding = "BILLING_DB"

@@ -70,6 +70,28 @@ export function detectBlockedResponse(response: Response, expectedCategory = "me
 	return { blocked: false };
 }
 
+const MAX_REDIRECTS = 5;
+const REDIRECT_STATUSES = [301, 302, 303, 307, 308];
+
+// The deadline must cover the body download, not just the headers: pipe the
+// body through a pass-through stream that clears the timer only on completion
+// or cancel, so a stalled origin still aborts mid-transfer.
+function keepDeadlineUntilBodyDone(response: Response, timeoutId: ReturnType<typeof setTimeout>): Response {
+	if (!response.body) {
+		clearTimeout(timeoutId);
+		return response;
+	}
+	const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+		flush() {
+			clearTimeout(timeoutId);
+		},
+		cancel() {
+			clearTimeout(timeoutId);
+		}
+	}));
+	return new Response(body, response);
+}
+
 export async function fetchFromOrigin(
 	url: string,
 	env: Env,
@@ -84,10 +106,14 @@ export async function fetchFromOrigin(
 	const fetchTimeout = timeout || parseInt(env.FETCH_TIMEOUT || "30000", 10);
 	const controller = new AbortController();
 	const timeoutId = setTimeout(() => controller.abort(), fetchTimeout);
-	const forwardedHeaders = getForwardedHeaders(clientRequest);
-	const headers: Record<string, string> = {
+	// Ask for an unencoded body so Content-Length matches the bytes we stream.
+	const baseHeaders: Record<string, string> = {
 		...FALLBACK_HEADERS,
-		...forwardedHeaders
+		"Accept-Encoding": "identity"
+	};
+	let headers: Record<string, string> = {
+		...baseHeaders,
+		...getForwardedHeaders(clientRequest)
 	};
 	if (env.ORIGIN_USER_AGENT) {
 		headers["User-Agent"] = env.ORIGIN_USER_AGENT;
@@ -98,33 +124,47 @@ export async function fetchFromOrigin(
 			headers["X-Forwarded-For"] = clientIp;
 		}
 	}
+	let currentUrl = url;
 	try {
-		const response = await fetch(url, {
-			signal: controller.signal,
-			headers,
-			redirect: "follow"
-		});
-		const finalUrl = response.url;
-		if (finalUrl && finalUrl !== url) {
-			const validation = validateUrlForFetch(finalUrl);
+		for (let hop = 0; ; hop++) {
+			const response = await fetch(currentUrl, {
+				signal: controller.signal,
+				headers,
+				redirect: "manual"
+			});
+			if (!REDIRECT_STATUSES.includes(response.status)) {
+				return keepDeadlineUntilBodyDone(response, timeoutId);
+			}
+			const location = response.headers.get("location");
+			if (!location) {
+				return keepDeadlineUntilBodyDone(response, timeoutId);
+			}
+			if (hop >= MAX_REDIRECTS) {
+				throw new Error("Too many redirects");
+			}
+			const nextUrl = new URL(location, currentUrl).toString();
+			const validation = validateUrlForFetch(nextUrl);
 			if (!validation.valid) {
 				throw new Error(`Redirect to invalid URL blocked: ${validation.reason}`);
 			}
-			if (validateRedirect) {
-				const allowed = await validateRedirect(finalUrl);
-				if (!allowed) {
-					throw new Error(`Redirect to non-allowed origin blocked: ${finalUrl}`);
+			if (validateRedirect && !(await validateRedirect(nextUrl))) {
+				throw new Error(`Redirect to non-allowed origin blocked: ${nextUrl}`);
+			}
+			// Never leak client-identifying headers to a different origin.
+			if (new URL(nextUrl).origin !== new URL(currentUrl).origin) {
+				headers = { ...baseHeaders };
+				if (env.ORIGIN_USER_AGENT) {
+					headers["User-Agent"] = env.ORIGIN_USER_AGENT;
 				}
 			}
+			currentUrl = nextUrl;
 		}
-		return response;
 	} catch (error) {
+		clearTimeout(timeoutId);
 		if (error instanceof Error && error.name === "AbortError") {
 			throw new Error(`Request timeout after ${fetchTimeout}ms`);
 		}
 		throw error;
-	} finally {
-		clearTimeout(timeoutId);
 	}
 }
 
@@ -157,6 +197,12 @@ export interface SizeValidation {
 }
 
 export function validateResponseSize(response: Response, maxSize: number): SizeValidation {
+	// An encoded body (rare: we request identity, but not every origin obeys) makes
+	// Content-Length describe bytes we are not streaming — treat it as unknown.
+	const encoding = response.headers.get("content-encoding");
+	if (encoding && encoding.toLowerCase() !== "identity") {
+		return { valid: true, size: null };
+	}
 	const contentLength = response.headers.get("content-length");
 	if (!contentLength) {
 		return { valid: true, size: null };

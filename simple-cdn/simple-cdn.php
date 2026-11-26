@@ -236,11 +236,12 @@ final class Simple_CDN {
 		$hosts = implode( '|', array_map( function ( $h ) { return preg_quote( $h, '~' ); }, $config['site_hosts'] ) );
 		$exts  = implode( '|', array_map( function ( $e ) { return preg_quote( (string) $e, '~' ); }, array_keys( $by_ext ) ) );
 
-		// A URL-path character is anything except whitespace, quotes, <>, parentheses, comma
-		// and backslash... with one exception: the pair "\/" is allowed, so JSON-escaped URLs
-		// (https:\/\/example.com\/a.jpg) work. Excluding bare backslashes also stops us from
+		// A URL-path character is anything except whitespace, quotes, <>, parentheses, comma,
+		// backslash, ? and #... with one exception: the pair "\/" is allowed, so JSON-escaped
+		// URLs (https:\/\/example.com\/a.jpg) work. Excluding ? and # stops the path before
+		// query strings and fragments; excluding bare backslashes also stops us from
 		// mangling things like the JavaScript regex /\.jpg$/.
-		$char = '(?:[^\s"\'<>(),\\\\]|\\\\/)';
+		$char = '(?:[^\s"\'<>(),\\\\?#]|\\\\/)';
 
 		$pattern = '~'
 			// Branch 1: absolute or protocol-relative URL on one of our hosts.
@@ -266,8 +267,11 @@ final class Simple_CDN {
 					return $url;
 				}
 
+				// Match exclusions against the URL both as written and with escaped
+				// slashes normalized, so "/a.jpg" also catches "a\/b.jpg" in JSON.
+				$unescaped = str_replace( '\\/', '/', $url );
 				foreach ( $config['excluded'] as $needle ) {
-					if ( '' !== $needle && false !== strpos( $url, $needle ) ) {
+					if ( '' !== $needle && ( false !== strpos( $url, $needle ) || false !== strpos( $unescaped, $needle ) ) ) {
 						return $url;
 					}
 				}
@@ -377,20 +381,22 @@ final class Simple_CDN {
 				$seen_hosts[ $host ] = true;
 			}
 
+			// Empty stays empty: a cleared list is a valid choice, and a list emptied
+			// by the clash rule below must not refill with defaults on the next save.
 			$exts = self::sanitize_extensions( $in['extensions'] ?? '' );
-			if ( ! $exts ) {
-				$exts = self::default_target( $i )['extensions'];
-			}
 
-			// One extension can only go to one CDN. Earlier slots win.
-			$clash = array_values( array_intersect( $exts, array_keys( $seen_exts ) ) );
-			if ( $clash ) {
-				$exts = array_values( array_diff( $exts, $clash ) );
-				/* translators: 1: CDN slot label, 2: extension list */
-				add_settings_error( self::OPTION, 'ext_clash_' . $i, sprintf( __( '%1$s: removed extensions already used by an earlier CDN: %2$s', 'simple-cdn' ), $label, implode( ', ', $clash ) ), 'warning' );
-			}
-			foreach ( $exts as $e ) {
-				$seen_exts[ $e ] = true;
+			// One extension can only go to one CDN, and only enabled CDNs (hostname
+			// set) reserve theirs. Earlier slots win.
+			if ( '' !== $host ) {
+				$clash = array_values( array_intersect( $exts, array_keys( $seen_exts ) ) );
+				if ( $clash ) {
+					$exts = array_values( array_diff( $exts, $clash ) );
+					/* translators: 1: CDN slot label, 2: extension list */
+					add_settings_error( self::OPTION, 'ext_clash_' . $i, sprintf( __( '%1$s: removed extensions already used by an earlier CDN: %2$s', 'simple-cdn' ), $label, implode( ', ', $clash ) ), 'warning' );
+				}
+				foreach ( $exts as $e ) {
+					$seen_exts[ $e ] = true;
+				}
 			}
 
 			$out['targets'][ $i ] = array(

@@ -15,6 +15,12 @@ export interface HtmlViewerOptions {
 	env: Env;
 }
 
+// Request-derived values land in HTML text, attributes and a <script> block;
+// escape for the HTML contexts so a crafted path can't inject markup.
+function esc(value: string | undefined): string {
+	return (value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 export function createHtmlViewer(options: HtmlViewerOptions): Response {
 	const {
 		imageData,
@@ -26,12 +32,10 @@ export function createHtmlViewer(options: HtmlViewerOptions): Response {
 		cacheKey,
 		cachedAt,
 		processingTime,
-		logs,
-		env
+		logs
 	} = options;
 	const base64 = arrayBufferToBase64(imageData);
 	const dataUrl = `data:${contentType};base64,${base64}`;
-	const deleteUrl = `/${cacheKey}`;
 	const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -290,14 +294,11 @@ export function createHtmlViewer(options: HtmlViewerOptions): Response {
         <h1>Debug Viewer</h1>
         <div class="subtitle">Bandwidth Saver CDN Worker \xB7 v${VERSION}</div>
       </div>
-      <button class="delete-btn" id="deleteBtn" onclick="deleteImage()">Delete Image</button>
     </header>
-
-    <div id="message"></div>
 
     <div class="image-section">
       <div class="image-wrapper">
-        <img src="${dataUrl}" alt="CDN cached image" id="imagePreview" />
+        <img src="${esc(dataUrl)}" alt="CDN cached image" id="imagePreview" />
       </div>
     </div>
 
@@ -309,7 +310,7 @@ export function createHtmlViewer(options: HtmlViewerOptions): Response {
             <div class="info-row">
               <div class="info-label">Cache Status</div>
               <div class="info-value">
-                <span class="status-badge status-${status}">${status}</span>
+                <span class="status-badge status-${esc(status)}">${esc(status)}</span>
               </div>
             </div>
             <div class="info-row">
@@ -326,7 +327,7 @@ export function createHtmlViewer(options: HtmlViewerOptions): Response {
             </div>
             <div class="info-row">
               <div class="info-label">Content Type</div>
-              <div class="info-value">${contentType}</div>
+              <div class="info-value">${esc(contentType)}</div>
             </div>
           </div>
 
@@ -336,13 +337,13 @@ export function createHtmlViewer(options: HtmlViewerOptions): Response {
               <div class="info-label">Cache Key</div>
             </div>
             <div class="url-block">
-              <a href="${sourceUrl}" target="_blank">${cacheKey}</a>
+              <a href="${esc(sourceUrl)}" target="_blank">${esc(cacheKey)}</a>
             </div>
             <div class="info-row" style="margin-top: 16px;">
               <div class="info-label">CDN URL</div>
             </div>
             <div class="url-block">
-              <a href="${cdnUrl}" target="_blank">${cdnUrl}</a>
+              <a href="${esc(cdnUrl)}" target="_blank">${esc(cdnUrl)}</a>
             </div>
             ${cachedAt ? `
             <div class="info-row" style="margin-top: 16px;">
@@ -359,9 +360,9 @@ export function createHtmlViewer(options: HtmlViewerOptions): Response {
             <div class="logs">
               ${logs.map((entry) => `
                 <div class="log-entry">
-                  <div class="log-time">${entry.time}</div>
-                  <div class="log-action">${entry.action}</div>
-                  <div class="log-details">${entry.details || ""}</div>
+                  <div class="log-time">${esc(entry.time)}</div>
+                  <div class="log-action">${esc(entry.action)}</div>
+                  <div class="log-details">${esc(entry.details || "")}</div>
                 </div>
               `).join("")}
             </div>
@@ -371,49 +372,6 @@ export function createHtmlViewer(options: HtmlViewerOptions): Response {
     </div>
   </div>
 
-  <script>
-    const deleteUrl = '${deleteUrl}';
-
-    async function deleteImage() {
-      const btn = document.getElementById('deleteBtn');
-      const message = document.getElementById('message');
-      const img = document.getElementById('imagePreview');
-
-      if (!confirm('Are you sure you want to delete this image from the cache?')) {
-        return;
-      }
-
-      btn.disabled = true;
-      btn.textContent = 'Deleting...';
-      message.style.display = 'none';
-
-      try {
-        const response = await fetch(deleteUrl, {
-          method: 'DELETE',
-        });
-
-        if (response.ok) {
-          const result = await response.json();
-          message.className = 'success';
-          message.textContent = 'Image deleted successfully from cache';
-          message.style.display = 'block';
-
-          // Fade out image
-          img.style.opacity = '0.3';
-          btn.textContent = 'Deleted';
-          btn.style.background = '#999';
-        } else {
-          throw new Error('Failed to delete image');
-        }
-      } catch (error) {
-        message.className = 'error';
-        message.textContent = 'Error deleting image: ' + error.message;
-        message.style.display = 'block';
-        btn.disabled = false;
-        btn.textContent = 'Delete Image';
-      }
-    }
-  <\/script>
 </body>
 </html>`;
 	return new Response(html, {

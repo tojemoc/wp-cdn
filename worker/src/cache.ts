@@ -10,13 +10,25 @@ export async function getCacheHead(env: Env, cacheKey: string): Promise<R2Object
 	return await env.R2.head(cacheKey);
 }
 
-export function handleConditionalRequest(request: Request, etag: string): Response | null {
+// RFC 9110 If-None-Match: supports "*", comma-separated tag lists and weak tags.
+export function etagMatches(ifNoneMatch: string | null, httpEtag: string): boolean {
+	if (!ifNoneMatch) {
+		return false;
+	}
+	if (ifNoneMatch.trim() === "*") {
+		return true;
+	}
+	const bare = httpEtag.replace(/^W\//i, "").replace(/^"|"$/g, "");
+	return ifNoneMatch.split(",").some((tag) => tag.trim().replace(/^W\//i, "").replace(/^"|"$/g, "") === bare);
+}
+
+export function handleConditionalRequest(request: Request, httpEtag: string): Response | null {
 	const ifNoneMatch = request.headers.get("If-None-Match");
-	if (ifNoneMatch && ifNoneMatch === etag) {
+	if (etagMatches(ifNoneMatch, httpEtag)) {
 		return new Response(null, {
 			status: 304,
 			headers: {
-				"ETag": etag,
+				"ETag": httpEtag,
 				"Cache-Control": "public, max-age=31536000, immutable",
 				...getCORSHeaders()
 			}
@@ -25,16 +37,27 @@ export function handleConditionalRequest(request: Request, etag: string): Respon
 	return null;
 }
 
-export async function getFromCacheWithRange(env: Env, cacheKey: string, range?: RangeInfo): Promise<R2ObjectBody | null> {
+export async function getFromCacheWithRange(env: Env, cacheKey: string, range?: RangeInfo, etag?: string): Promise<R2ObjectBody | null> {
 	if (range) {
 		return await env.R2.get(cacheKey, {
 			range: {
 				offset: range.start,
 				length: range.length
-			}
+			},
+			...etag ? { onlyIf: { etagMatches: etag } } : {}
 		});
 	}
 	return await env.R2.get(cacheKey);
+}
+
+// Delete only if the object is still the one we inspected. A tiny race remains
+// between the head and the delete; the worst case is dropping a freshly replaced
+// object, which self-heals on the next origin fetch.
+export async function deleteIfUnchanged(env: Env, cacheKey: string, etag: string): Promise<void> {
+	const fresh = await getCacheHead(env, cacheKey);
+	if (fresh && fresh.etag === etag) {
+		await env.R2.delete(cacheKey);
+	}
 }
 
 export async function storeInCacheStream(
