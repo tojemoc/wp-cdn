@@ -251,8 +251,9 @@ final class Simple_CDN {
 			. '|(?<=["\'(=\s,])(?!(?:\\\\?/){2}))'
 			// The path: starts with a slash, ends with one of our extensions.
 			. '(?<path>\\\\?/' . $char . '*?\.(?<ext>' . $exts . '))'
-			// Optional query string (kept as-is).
-			. '(?<query>\?[^\s"\'<>(),\\\\]*)?'
+			// Optional query string (kept as-is). Commas are valid inside a query, but
+			// a comma followed by whitespace starts the next srcset candidate — stop there.
+			. '(?<query>\?(?:[^\s"\'<>(),\\\\]|,(?!\s))*)?'
 			// The URL must end here: whitespace, quote, bracket, comma, "&", backslash, ?, # or end.
 			// This is what stops ".jpg" from matching inside ".jpgx" or ".jpg.php".
 			. '(?=[\s"\'<>(),&\\\\?#]|$)'

@@ -37,7 +37,7 @@ If both claim an extension, CDN 1 wins and the settings page tells you.
 ## What was intentionally dropped from Bandwidth Saver
 
 * Everything that talks to `billing.bandwidth-saver.com`: accounts, Stripe checkout, plan selector, usage charts, API-key encryption, onboarding (~90% of the plugin's code).
-* The per-image `onerror` fallback, its 14 KB JS file and CSS. The Worker answers with a 302 to your origin whenever it knows upfront that it can't serve a file. One case slips through: when the origin omits `Content-Length` (chunked responses) and the body exceeds `MAX_FILE_SIZE`, the Worker only finds out mid-stream and cannot redirect — the image just breaks. It's easy to add the fallback back if you want it.
+* The per-image `onerror` fallback, its 14 KB JS file and CSS. The Worker answers with a 302 to your origin whenever it knows upfront that it can't serve a file. Mid-stream failures slip through: when the origin omits `Content-Length` (chunked responses) and the body exceeds `MAX_FILE_SIZE`, when the origin stalls after sending headers and hits the fetch timeout, or when the stream is otherwise interrupted — the Worker can't redirect and the image just breaks. It's easy to add the fallback back if you want it.
 * Rewriting every image host. Only *your* site's hostnames are rewritten (add more with the `simple_cdn_site_hostnames` filter).
 
 ## Filters
@@ -59,4 +59,4 @@ ALLOWED_ORIGINS = example.com,www.example.com
 ```
 
 `*.example.com` does **not** match the bare `example.com`; list both.
-The Worker ignores query strings, so replacing an image *at the same path* keeps serving the old R2 copy. Deleting the object in R2 (or fetching once with `?force=1`) is not enough on its own: the Worker also tells browsers to cache the file immutably for a year, so visitors keep their copy. To actually refresh an image, give it a new URL — for example a versioned query string like `photo.jpg?v=2` — after updating R2.
+The Worker ignores query strings, so replacing an image *at the same path* keeps serving the old R2 copy — and browsers hold it immutably for a year. To refresh: fetch the image once through a URL it has never served, e.g. `photo.jpg?v=2&force=1`. `force` makes the Worker refetch the origin and replace the R2 object; the URL must be fresh because the `force` response is itself cached immutably (reusing `?force=1` alone may hit a stale browser or edge cache). Verify the response shows the new image, then switch your markup to the versioned URL (`photo.jpg?v=2`).

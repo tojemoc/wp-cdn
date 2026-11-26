@@ -73,20 +73,31 @@ export function detectBlockedResponse(response: Response, expectedCategory = "me
 const MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = [301, 302, 303, 307, 308];
 
-// The deadline must cover the body download, not just the headers: pipe the
-// body through a pass-through stream that clears the timer only on completion
-// or cancel, so a stalled origin still aborts mid-transfer.
-function keepDeadlineUntilBodyDone(response: Response, timeoutId: ReturnType<typeof setTimeout>): Response {
+// The deadline is an inactivity limit, not a total duration: every chunk that
+// arrives resets the timer, so a slow-but-progressing download survives while a
+// stalled origin still aborts. The timer dies with the body.
+function keepDeadlineUntilBodyDone(response: Response, controller: AbortController, timeout: number): Response {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const arm = () => {
+		timer = setTimeout(() => controller.abort(), timeout);
+	};
 	if (!response.body) {
-		clearTimeout(timeoutId);
 		return response;
 	}
 	const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+		start() {
+			arm();
+		},
+		transform(chunk, c) {
+			if (timer) clearTimeout(timer);
+			arm();
+			c.enqueue(chunk);
+		},
 		flush() {
-			clearTimeout(timeoutId);
+			if (timer) clearTimeout(timer);
 		},
 		cancel() {
-			clearTimeout(timeoutId);
+			if (timer) clearTimeout(timer);
 		}
 	}));
 	return new Response(body, response);
@@ -105,6 +116,7 @@ export async function fetchFromOrigin(
 	}
 	const fetchTimeout = timeout || parseInt(env.FETCH_TIMEOUT || "30000", 10);
 	const controller = new AbortController();
+	// Covers connect/redirect/headers only; the body gets its own inactivity timer.
 	const timeoutId = setTimeout(() => controller.abort(), fetchTimeout);
 	// Ask for an unencoded body so Content-Length matches the bytes we stream.
 	const baseHeaders: Record<string, string> = {
@@ -133,11 +145,13 @@ export async function fetchFromOrigin(
 				redirect: "manual"
 			});
 			if (!REDIRECT_STATUSES.includes(response.status)) {
-				return keepDeadlineUntilBodyDone(response, timeoutId);
+				clearTimeout(timeoutId);
+				return keepDeadlineUntilBodyDone(response, controller, fetchTimeout);
 			}
 			const location = response.headers.get("location");
 			if (!location) {
-				return keepDeadlineUntilBodyDone(response, timeoutId);
+				clearTimeout(timeoutId);
+				return keepDeadlineUntilBodyDone(response, controller, fetchTimeout);
 			}
 			if (hop >= MAX_REDIRECTS) {
 				throw new Error("Too many redirects");

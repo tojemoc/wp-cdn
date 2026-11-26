@@ -2,7 +2,7 @@ import type { Env, LogEntry } from "./env";
 import { parseUrl, validateOrigin, validateUrlForFetch, isMediaContentType, isImageContentType } from "./validation";
 import { fetchMediaFromOrigin, validateResponseSize, createSizeLimitedStream } from "./origin";
 import { VERSION, getCORSHeaders, errorResponse, formatBytes, parseFileSize, mediaSafetyHeaders } from "./utils";
-import { getFromCache, getCacheHead, handleConditionalRequest, etagMatches, getFromCacheWithRange, storeInCacheStream, deleteIfUnchanged } from "./cache";
+import { getFromCache, getCacheHead, handleConditionalRequest, getFromCacheWithRange, storeInCacheStream, deleteIfUnchanged } from "./cache";
 import { parseRangeHeader, buildContentRangeHeader } from "./range";
 import { createHtmlViewer } from "./viewer";
 import { createStatsResponse, createLogger } from "./analytics";
@@ -202,7 +202,8 @@ export default {
 				// representation — ignore Range and send the full 200 response.
 				// shortcut: a date-form If-Range never matches, so we resend the body.
 				const ifRange = request.headers.get("If-Range");
-				const rangeAllowed = !ifRange || etagMatches(ifRange.trim(), cacheResult.httpEtag);
+				// If-Range requires a strong entity-tag match: no weak tags or lists.
+				const rangeAllowed = !ifRange || ifRange.trim() === cacheResult.httpEtag;
 				const rangeInfo = rangeHeader && rangeAllowed ? parseRangeHeader(rangeHeader, totalSize) : null;
 
 				if (rangeHeader && rangeAllowed && !rangeInfo) {
@@ -282,7 +283,9 @@ export default {
 				let fullObject: R2ObjectBody | null = null;
 				if ("body" in cacheResult) {
 					fullObject = cacheResult as R2ObjectBody;
-				} else if (isStandardRange && rangeData) {
+				} else if (rangeInfo && rangeData && rangeData.etag === cacheResult.etag) {
+					// Reuse the prefetched body only when it is a same-version, full-object
+					// range — an If-Range mismatch (rangeInfo null) must refetch the body.
 					fullObject = rangeData;
 				} else if (rangeHeader) {
 					fullObject = await getFromCache(env, parsed.cacheKey);

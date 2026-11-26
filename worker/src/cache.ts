@@ -18,8 +18,10 @@ export function etagMatches(ifNoneMatch: string | null, httpEtag: string): boole
 	if (ifNoneMatch.trim() === "*") {
 		return true;
 	}
+	// Split on commas that are not inside a quoted tag — "a,b" is one tag.
+	const tags = ifNoneMatch.split(/,(?=(?:[^"]*"[^"]*")*[^"]*$)/);
 	const bare = httpEtag.replace(/^W\//i, "").replace(/^"|"$/g, "");
-	return ifNoneMatch.split(",").some((tag) => tag.trim().replace(/^W\//i, "").replace(/^"|"$/g, "") === bare);
+	return tags.some((tag) => tag.trim().replace(/^W\//i, "").replace(/^"|"$/g, "") === bare);
 }
 
 export function handleConditionalRequest(request: Request, httpEtag: string): Response | null {
@@ -39,13 +41,19 @@ export function handleConditionalRequest(request: Request, httpEtag: string): Re
 
 export async function getFromCacheWithRange(env: Env, cacheKey: string, range?: RangeInfo, etag?: string): Promise<R2ObjectBody | null> {
 	if (range) {
-		return await env.R2.get(cacheKey, {
+		const result = await env.R2.get(cacheKey, {
 			range: {
 				offset: range.start,
 				length: range.length
 			},
 			...etag ? { onlyIf: { etagMatches: etag } } : {}
 		});
+		// A failed onlyIf precondition returns the object metadata without a body —
+		// report it the same way as a miss so callers take the redirect path.
+		if (result && !("body" in result)) {
+			return null;
+		}
+		return result;
 	}
 	return await env.R2.get(cacheKey);
 }

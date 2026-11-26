@@ -215,14 +215,18 @@ export class SiteUsageTracker {
 			this.cacheHits -= pending.cacheHits;
 			this.cacheMisses -= pending.cacheMisses;
 			this.d1Failures = 0;
-			await this.state.storage.put({
-				[STORAGE_KEYS.BANDWIDTH]: this.bandwidth,
-				[STORAGE_KEYS.REQUESTS]: this.requests,
-				[STORAGE_KEYS.CACHE_HITS]: this.cacheHits,
-				[STORAGE_KEYS.CACHE_MISSES]: this.cacheMisses,
-				[STORAGE_KEYS.D1_FAILURES]: 0
+			// Checkpoint counters and drop the pending flush atomically: a crash
+			// between them would replay the settled flush and subtract it twice.
+			await this.state.storage.transaction(async (txn) => {
+				await txn.put({
+					[STORAGE_KEYS.BANDWIDTH]: this.bandwidth,
+					[STORAGE_KEYS.REQUESTS]: this.requests,
+					[STORAGE_KEYS.CACHE_HITS]: this.cacheHits,
+					[STORAGE_KEYS.CACHE_MISSES]: this.cacheMisses,
+					[STORAGE_KEYS.D1_FAILURES]: 0
+				});
+				await txn.delete(STORAGE_KEYS.PENDING_FLUSH);
 			});
-			await this.state.storage.delete(STORAGE_KEYS.PENDING_FLUSH);
 		} catch (err) {
 			try {
 				this.d1Failures += 1;
