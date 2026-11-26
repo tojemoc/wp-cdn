@@ -475,11 +475,19 @@ export default {
 					const reader = limitedStream.getReader();
 					let cacheAlive = cacheWriter !== null;
 					let timer: ReturnType<typeof setTimeout> | undefined;
+					let stallError: Error | undefined;
 					try {
 						for (;;) {
-							timer = setTimeout(() => void reader.cancel(new Error(`Origin stalled for ${fetchTimeout}ms`)), fetchTimeout);
+							// cancel() resolves a pending read with done:true, so record
+							// the stall and throw it ourselves — a stalled origin must not
+							// look like a clean EOF to the cache branch.
+							timer = setTimeout(() => {
+								stallError = new Error(`Origin stalled for ${fetchTimeout}ms`);
+								void reader.cancel(stallError);
+							}, fetchTimeout);
 							const { done, value } = await reader.read();
 							clearTimeout(timer);
+							if (stallError) throw stallError;
 							if (done) break;
 							await clientWriter.write(value);
 							if (cacheAlive) {
@@ -494,7 +502,7 @@ export default {
 						if (cacheAlive) await cacheWriter!.close();
 					} catch (e) {
 						if (timer) clearTimeout(timer);
-						await Promise.allSettled([clientWriter.abort(e), cacheAlive ? cacheWriter!.abort(e) : Promise.resolve()]);
+						await Promise.allSettled([reader.cancel(e), clientWriter.abort(e), cacheAlive ? cacheWriter!.abort(e) : Promise.resolve()]);
 					}
 				})());
 
