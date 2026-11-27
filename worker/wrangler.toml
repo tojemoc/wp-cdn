@@ -1,0 +1,45 @@
+name = "simple-cdn"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+# --- Required: the cache bucket ------------------------------------------
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "simple-cdn-cache"
+
+# --- Runtime config -------------------------------------------------------
+# ORIGIN_MODE: "open" (default, caches anything), "list" (only ALLOWED_ORIGINS),
+# or "registered" (only domains found in ORIGINS_KV).
+# For anything public-facing use "list" -- open mode lets strangers cache
+# arbitrary origins on your Cloudflare bill.
+[vars]
+ORIGIN_MODE = "list"
+ALLOWED_ORIGINS = "example.com,www.example.com"
+BLOCKED_ORIGINS = ""
+MAX_FILE_SIZE = "500MB"
+FETCH_TIMEOUT = "30000"
+DEBUG = "false"
+# ORIGIN_USER_AGENT = ""
+# FORWARD_CLIENT_IP = "false"
+
+# --- Optional: origin registry (ORIGIN_MODE = "registered") ---------------
+# KV values are JSON arrays of records: [{"site_id": 1, "status": "active"}]
+# [[kv_namespaces]]
+# binding = "ORIGINS_KV"
+# id = "your-kv-namespace-id"
+
+# --- Optional: usage tracking (Durable Object + D1) -----------------------
+# Only needed when ORIGIN_MODE = "registered" and you want per-site metrics.
+# [[durable_objects.bindings]]
+# name = "USAGE_TRACKER"
+# class_name = "SiteUsageTracker"
+#
+# [[migrations]]
+# tag = "v1"
+# new_sqlite_classes = ["SiteUsageTracker"]
+#
+# [[d1_databases]]
+# binding = "BILLING_DB"
+# database_name = "billing"
+# database_id = "your-d1-database-id"
